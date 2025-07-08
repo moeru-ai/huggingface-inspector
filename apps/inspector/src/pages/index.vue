@@ -13,6 +13,10 @@ interface CacheItem {
   size: number
   snapshot?: string
   architectures?: string[]
+  mainFile?: {
+    path: string
+    oid: string
+  }
   error?: string
 }
 
@@ -26,6 +30,11 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 
 // --- VueUse Composables ---
 const { copy, copied, text: copiedText, isSupported } = useClipboard({ legacy: true, source: '' })
+
+// --- Request Queue for Rate Limiting ---
+const requestQueue = ref<(() => Promise<void>)[]>([])
+const activeRequests = ref(0)
+const MAX_CONCURRENT_REQUESTS = 3 // Limit concurrent requests to be polite to the API
 
 // --- Computed Properties ---
 
@@ -71,8 +80,9 @@ async function handleFileChange(fileList: File[]) {
   isLoading.value = true
   error.value = null
   cacheItems.value = []
+  requestQueue.value = [] // Clear any previous queue
 
-  const isHubDir = fileList.some(f => (f as any).webkitRelativePath.includes('/snapshots/'))
+  const isHubDir = fileList.some(f => (f as any).webkitRelativePath.includes('/blobs/'))
   if (!isHubDir) {
     error.value = 'This does not look like a valid "hub" directory. Please ensure you select the correct folder.'
     isLoading.value = false
@@ -80,8 +90,51 @@ async function handleFileChange(fileList: File[]) {
   }
 
   try {
+    // Phase 1: Local processing. Fast and offline.
     const items = await processCacheData(fileList)
     cacheItems.value = items
+
+    // Phase 2: Enqueue remote resolution tasks for each model.
+    items.forEach((item) => {
+      if (item.type === 'model' && item.snapshot) {
+        const task = async () => {
+          try {
+            const repoFiles = await fetchRepoTree(item.name, item.snapshot!)
+            if (!repoFiles)
+              throw new Error('Could not fetch repo tree')
+
+            // Resolve config.json to get architectures
+            const configEntry = repoFiles.find(f => f.path === 'config.json')
+            if (configEntry) {
+              const configFile = fileList.find(f => f.webkitRelativePath.includes(`/blobs/${configEntry.oid}`))
+              if (configFile) {
+                const configJson = JSON.parse(await configFile.text())
+                item.architectures = configJson.architectures || ['Not specified']
+              }
+              else {
+                item.architectures = ['Config blob not in cache']
+              }
+            }
+            else {
+              item.architectures = ['No config.json in repo']
+            }
+
+            // Heuristic to find the main model file for path generation
+            const modelFileExtensions = ['.safetensors', '.onnx', '.bin']
+            const mainFileEntry = repoFiles.find(f => modelFileExtensions.some(ext => f.path.endsWith(ext)))
+            if (mainFileEntry) {
+              item.mainFile = { path: mainFileEntry.path, oid: mainFileEntry.oid }
+            }
+          }
+          catch (e) {
+            item.error = (e as Error).message
+            item.architectures = ['Resolution failed']
+          }
+        }
+        requestQueue.value.push(task)
+      }
+    })
+    processQueue() // Start processing the queue
   }
   catch (e: any) {
     error.value = `An error occurred while processing: ${e.message}`
@@ -91,13 +144,48 @@ async function handleFileChange(fileList: File[]) {
   }
 }
 
+// --- Queue Processing Logic ---
+async function processQueue() {
+  while (activeRequests.value < MAX_CONCURRENT_REQUESTS && requestQueue.value.length > 0) {
+    activeRequests.value++
+    const task = requestQueue.value.shift()
+    if (task) {
+      try {
+        await task()
+      }
+      catch (e) {
+        console.error('A task in the queue failed:', e)
+      }
+      finally {
+        activeRequests.value--
+        // Add a small delay between requests to be polite to the API
+        await new Promise(resolve => setTimeout(resolve, 200))
+        processQueue() // Try to process the next item
+      }
+    }
+  }
+}
+
 function toggleItem(id: string) {
   selectedItemId.value = selectedItemId.value === id ? null : id
 }
 
-// --- Data Processing ---
+// --- Data Processing & API ---
 
-async function processCacheData(fileList: File[]) {
+async function fetchRepoTree(repoName: string, revision: string): Promise<{ path: string, oid: string }[] | null> {
+  const url = `https://huggingface.co/api/models/${repoName}/tree/${revision}`
+  try {
+    const response = await fetch(url)
+    if (!response.ok)
+      return null
+    return await response.json()
+  }
+  catch {
+    return null
+  }
+}
+
+async function processCacheData(fileList: File[]): Promise<CacheItem[]> {
   const fileTree: Record<string, File[]> = {}
   for (const file of fileList) {
     const pathParts = (file as any).webkitRelativePath.split('/')
@@ -117,7 +205,6 @@ async function processCacheData(fileList: File[]) {
     const { type, name } = parseName(dirName)
     let totalSize = 0
     let snapshot: string | undefined
-    let architectures: string[] | undefined
     let itemError: string | undefined
     try {
       const blobFiles = itemFiles.filter(f => (f as any).webkitRelativePath.includes('/blobs/'))
@@ -125,16 +212,9 @@ async function processCacheData(fileList: File[]) {
       const refFile = itemFiles.find(f => (f as any).webkitRelativePath.endsWith('/refs/main'))
       if (refFile)
         snapshot = (await refFile.text()).trim()
-      if (snapshot && type === 'model') {
-        const configFile = itemFiles.find(f => (f as any).webkitRelativePath.includes(`/snapshots/${snapshot}/config.json`))
-        if (configFile) {
-          const configJson = JSON.parse(await configFile.text())
-          architectures = configJson.architectures || ['Not specified']
-        }
-      }
     }
     catch (e: any) { itemError = e.message }
-    processedItems.push({ id: dirName, type, name, path: dirName, size: totalSize, snapshot, architectures, error: itemError })
+    processedItems.push({ id: dirName, type, name, path: dirName, size: totalSize, snapshot, error: itemError })
   }
   return processedItems.sort((a, b) => b.size - a.size)
 }
@@ -146,10 +226,22 @@ function getHuggingFaceUrl(item: CacheItem) {
   return item.type === 'dataset' ? `${base}/datasets/${item.name}` : `${base}/${item.name}`
 }
 
-function getActualPath(item: CacheItem) {
+// Implements your rule: ${models--...}${repo_id}/snapshots/${ref}/${main_file}
+function getSymlinkPath(item: CacheItem) {
   if (!item.snapshot)
     return null
-  return `${item.path}/snapshots/${item.snapshot}`
+  let path = `${item.path}/snapshots/${item.snapshot}`
+  if (item.mainFile)
+    path += `/${item.mainFile.path}`
+
+  return path
+}
+
+// Implements your rule: ${models--...}${repo_id}/blobs/${main_file_blob_hash}
+function getActualPath(item: CacheItem) {
+  if (!item.mainFile)
+    return null
+  return `${item.path}/blobs/${item.mainFile.oid}`
 }
 
 function parseName(dirName: string): { type: CacheItem['type'], name: string } {
@@ -265,10 +357,17 @@ function formatBytes(bytes: number, decimals = 2) {
                     <div class="i-solar:diskette-line-duotone" />
                     <span>{{ formatBytes(item.size) }}</span>
                   </div>
-                  <div v-if="item.type === 'model' && item.architectures?.[0] && item.architectures[0] !== 'Not specified'" class="min-w-0 flex items-center gap-1.5 rounded-full bg-neutral-100 px-2 py-1 dark:bg-neutral-800" :title="item.architectures[0]">
+                  <!-- Chip for successfully fetched architecture -->
+                  <div v-if="item.type === 'model' && item.architectures && !['Not specified', 'No config.json in repo', 'Config blob not in cache', 'Resolution failed'].includes(item.architectures[0])" class="min-w-0 flex items-center gap-1.5 rounded-full bg-neutral-100 px-2 py-1 dark:bg-neutral-800" :title="item.architectures[0]">
                     <div class="i-solar:cpu-bolt-line-duotone" />
                     <span class="truncate">{{ item.architectures[0] }}</span>
                   </div>
+                  <!-- Chip for loading state -->
+                  <div v-else-if="item.type === 'model' && !item.architectures" class="min-w-0 flex animate-pulse items-center gap-1.5 rounded-full bg-neutral-100 px-2 py-1 dark:bg-neutral-800" title="Resolving metadata...">
+                    <div class="i-solar:cpu-bolt-line-duotone" />
+                    <span class="truncate">...</span>
+                  </div>
+                  <!-- Chip for internal processing error -->
                   <div v-if="item.error" class="flex items-center gap-1.5 rounded-full bg-red-100 px-2 py-1 text-red-600 font-medium dark:bg-red-900/50 dark:text-red-300">
                     <div class="i-solar:danger-triangle-line-duotone" />
                     <span>Error</span>
@@ -285,17 +384,19 @@ function formatBytes(bytes: number, decimals = 2) {
                 <!-- Symlink Path -->
                 <div class="grid grid-cols-[max-content_1fr_auto] items-center gap-x-2">
                   <strong class="text-neutral-600 dark:text-neutral-400">Symlink Path:</strong>
-                  <code class="truncate break-all font-mono" :title="item.path">{{ item.path }}</code>
-                  <button v-if="isSupported" title="Copy Symlink Path" class="text-neutral-400 transition-colors hover:text-primary-500 dark:hover:text-primary-400" @click.stop="copy(item.path)">
-                    <div v-if="copied && copiedText === item.path" class="i-solar:check-read-line-duotone text-green-500" />
+                  <code v-if="getSymlinkPath(item)" class="truncate break-all font-mono" :title="getSymlinkPath(item) || ''">{{ getSymlinkPath(item) }}</code>
+                  <span v-else class="text-neutral-500 font-mono">Resolving...</span>
+                  <button v-if="isSupported && getSymlinkPath(item)" title="Copy Symlink Path" class="text-neutral-400 transition-colors hover:text-primary-500 dark:hover:text-primary-400" @click.stop="copy(getSymlinkPath(item) || '')">
+                    <div v-if="copied && copiedText === getSymlinkPath(item)" class="i-solar:check-read-line-duotone text-green-500" />
                     <div v-else class="i-solar:copy-bold-duotone" />
                   </button>
                 </div>
                 <!-- Actual Path -->
-                <div v-if="getActualPath(item)" class="grid grid-cols-[max-content_1fr_auto] items-center gap-x-2">
+                <div class="grid grid-cols-[max-content_1fr_auto] items-center gap-x-2">
                   <strong class="text-neutral-600 dark:text-neutral-400">Actual Path:</strong>
-                  <code class="truncate break-all font-mono" :title="getActualPath(item) || ''">{{ getActualPath(item) }}</code>
-                  <button v-if="isSupported" title="Copy Actual Path" class="text-neutral-400 transition-colors hover:text-primary-500 dark:hover:text-primary-400" @click.stop="copy(getActualPath(item) || '')">
+                  <code v-if="getActualPath(item)" class="truncate break-all font-mono" :title="getActualPath(item) || ''">{{ getActualPath(item) }}</code>
+                  <span v-else class="text-neutral-500 font-mono">Resolving...</span>
+                  <button v-if="isSupported && getActualPath(item)" title="Copy Actual Path" class="text-neutral-400 transition-colors hover:text-primary-500 dark:hover:text-primary-400" @click.stop="copy(getActualPath(item) || '')">
                     <div v-if="copied && copiedText === getActualPath(item)" class="i-solar:check-read-line-duotone text-green-500" />
                     <div v-else class="i-solar:copy-bold-duotone" />
                   </button>
@@ -311,12 +412,13 @@ function formatBytes(bytes: number, decimals = 2) {
                   <div class="grid grid-cols-[max-content_1fr] items-start gap-x-2">
                     <strong class="text-neutral-600 dark:text-neutral-400">Architectures:</strong>
                     <div>
-                      <ul v-if="item.architectures && item.architectures[0] !== 'Not specified'" class="list-disc list-inside">
+                      <ul v-if="item.architectures && !['Not specified', 'No config.json in repo', 'Config blob not in cache', 'Resolution failed'].includes(item.architectures[0])" class="list-disc list-inside">
                         <li v-for="arch in item.architectures" :key="arch" class="font-mono">
                           {{ arch }}
                         </li>
                       </ul>
-                      <span v-else class="text-neutral-500">config.json not found or empty</span>
+                      <span v-else-if="item.architectures" class="text-neutral-500 font-mono">{{ item.architectures[0] }}</span>
+                      <span v-else class="text-neutral-500">Resolving...</span>
                     </div>
                   </div>
                 </template>
