@@ -1,6 +1,4 @@
-![](./apps/inspector/public/favicon.svg)
-
-# 🤗 HuggingFace Inspector
+# ![](./apps/inspector/public/favicon.svg) HuggingFace Inspector
 
 [[Try it](https://huggingface-inspector.netlify.app)]
 
