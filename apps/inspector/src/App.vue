@@ -39,7 +39,7 @@ const toggleDark = useToggle(isDark)
         </button>
       </div>
     </div>
-    <div mt-10 h-full w-full flex flex-col items-center gap-2>
+    <div mt-12 h-full w-full flex flex-col items-center gap-2>
       <RouterView />
     </div>
   </div>

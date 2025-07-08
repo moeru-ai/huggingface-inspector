@@ -5,6 +5,8 @@ import { computed, ref } from 'vue'
 
 // --- Component Interface & State ---
 
+type ModelFormat = 'Sharded Safetensors' | 'ONNX' | 'Single File' | 'Unknown'
+
 interface CacheItem {
   id: string
   type: 'model' | 'dataset' | 'unknown'
@@ -13,6 +15,7 @@ interface CacheItem {
   size: number
   snapshot?: string
   architectures?: string[]
+  modelFormat?: ModelFormat
   mainFile?: {
     path: string
     oid: string
@@ -99,31 +102,69 @@ async function handleFileChange(fileList: File[]) {
       if (item.type === 'model' && item.snapshot) {
         const task = async () => {
           try {
-            const repoFiles = await fetchRepoTree(item.name, item.snapshot!)
-            if (!repoFiles)
+            const rootFiles = await fetchRepoTree(item.name, item.snapshot!)
+            if (!rootFiles)
               throw new Error('Could not fetch repo tree')
 
             // Resolve config.json to get architectures
-            const configEntry = repoFiles.find(f => f.path === 'config.json')
+            const configEntry = rootFiles.find(f => f.path === 'config.json')
             if (configEntry) {
-              const configFile = fileList.find(f => f.webkitRelativePath.includes(`/blobs/${configEntry.oid}`))
-              if (configFile) {
-                const configJson = JSON.parse(await configFile.text())
-                item.architectures = configJson.architectures || ['Not specified']
+              const configOid = configEntry.lfs?.oid || configEntry.oid
+              const configFile = fileList.find(f => f.webkitRelativePath.includes(`/blobs/${configOid}`))
+              const configFileContent = await configFile.text()
+              try {
+                if (configFile && configFileContent) {
+                  const configJson = JSON.parse(configFileContent)
+                  item.architectures = configJson.architectures || ['Not specified']
+                }
+                else {
+                  item.architectures = ['Config blob not in cache']
+                }
               }
-              else {
-                item.architectures = ['Config blob not in cache']
+              catch (e) {
+                console.error('Failed to parse config.json for', item.name, configFileContent, e)
+                throw e
               }
             }
             else {
               item.architectures = ['No config.json in repo']
             }
 
-            // Heuristic to find the main model file for path generation
-            const modelFileExtensions = ['.safetensors', '.onnx', '.bin']
-            const mainFileEntry = repoFiles.find(f => modelFileExtensions.some(ext => f.path.endsWith(ext)))
+            // --- Advanced Model File Discovery ---
+            const allFiles = [...rootFiles]
+            const onnxDir = rootFiles.find(f => f.path === 'onnx' && f.type === 'directory')
+            if (onnxDir) {
+              const onnxFiles = await fetchRepoTree(item.name, item.snapshot!, 'onnx')
+              if (onnxFiles) {
+                // Prepend the directory to the path for correct symlink generation
+                allFiles.push(...onnxFiles.map(f => ({ ...f, path: `onnx/${f.path}` })))
+              }
+            }
+
+            // Priority 1: Find sharded safetensors index
+            let mainFileEntry = allFiles.find(f => f.path.endsWith('model.safetensors.index.json'))
             if (mainFileEntry) {
-              item.mainFile = { path: mainFileEntry.path, oid: mainFileEntry.oid }
+              item.modelFormat = 'Sharded Safetensors'
+            }
+            else {
+              // Priority 2: Find a "base" ONNX model
+              const onnxBlacklist = ['_quantized', '_fp16', '_int8', '_merged', '_bnb4', '_q4', '_uint8']
+              mainFileEntry = allFiles.find(f => f.path.endsWith('.onnx') && !onnxBlacklist.some(suffix => f.path.includes(suffix)))
+              if (mainFileEntry) {
+                item.modelFormat = 'ONNX'
+              }
+              else {
+                // Priority 3: Fallback to any model file
+                const modelFileExtensions = ['.safetensors', '.onnx', '.bin']
+                mainFileEntry = allFiles.find(f => modelFileExtensions.some(ext => f.path.endsWith(ext)))
+                item.modelFormat = mainFileEntry ? 'Single File' : 'Unknown'
+              }
+            }
+
+            if (mainFileEntry) {
+              // CRITICAL: Use LFS oid if it exists, otherwise fallback to git oid
+              const blobOid = mainFileEntry.lfs?.oid || mainFileEntry.oid
+              item.mainFile = { path: mainFileEntry.path, oid: blobOid }
             }
           }
           catch (e) {
@@ -172,8 +213,23 @@ function toggleItem(id: string) {
 
 // --- Data Processing & API ---
 
-async function fetchRepoTree(repoName: string, revision: string): Promise<{ path: string, oid: string }[] | null> {
-  const url = `https://huggingface.co/api/models/${repoName}/tree/${revision}`
+interface RepoFile {
+  path: string
+  oid: string
+  type: 'file' | 'directory'
+  size?: number
+  lfs?: {
+    oid: string
+    size: number
+    pointerSize: number
+  }
+}
+
+async function fetchRepoTree(repoName: string, revision: string, subfolder?: string): Promise<RepoFile[] | null> {
+  let url = `https://huggingface.co/api/models/${repoName}/tree/${revision}`
+  if (subfolder) {
+    url += `/${subfolder}`
+  }
   try {
     const response = await fetch(url)
     if (!response.ok)
@@ -318,7 +374,7 @@ function formatBytes(bytes: number, decimals = 2) {
         </div>
       </div>
 
-      <div v-auto-animate class="grid grid-cols-1 gap-2 2xl:grid-cols-3 sm:grid-cols-2" max-h="80dvh" overflow-y-auto>
+      <div v-auto-animate class="grid grid-cols-1 gap-2 2xl:grid-cols-3 lg:grid-cols-2" max-h="80dvh" overflow-y-auto>
         <div
           v-for="item in filteredItems" :key="item.id"
           class="flex flex-col overflow-hidden border border-2 border-neutral-100 rounded-xl bg-neutral-200/50 shadow-sm transition-all duration-200 dark:border-neutral-800 hover:border-primary-300 dark:bg-neutral-800/50 hover:shadow-md dark:hover:border-primary-700"
@@ -356,6 +412,11 @@ function formatBytes(bytes: number, decimals = 2) {
                   <div class="flex items-center gap-1.5">
                     <div class="i-solar:diskette-line-duotone" />
                     <span>{{ formatBytes(item.size) }}</span>
+                  </div>
+                  <!-- Chip for model format -->
+                  <div v-if="item.modelFormat && item.modelFormat !== 'Unknown'" class="min-w-0 flex items-center gap-1.5 rounded-full bg-neutral-100 px-2 py-1 dark:bg-neutral-800" :title="item.modelFormat">
+                    <div class="i-solar:structure-bold-duotone" />
+                    <span class="truncate">{{ item.modelFormat }}</span>
                   </div>
                   <!-- Chip for successfully fetched architecture -->
                   <div v-if="item.type === 'model' && item.architectures && !['Not specified', 'No config.json in repo', 'Config blob not in cache', 'Resolution failed'].includes(item.architectures[0])" class="min-w-0 flex items-center gap-1.5 rounded-full bg-neutral-100 px-2 py-1 dark:bg-neutral-800" :title="item.architectures[0]">

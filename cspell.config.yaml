@@ -13,7 +13,9 @@ words:
   - nekw
   - nolyfill
   - ofetch
+  - onnx
   - pkgroll
+  - safetensors
   - Shaderr
   - sizecheck
   - splitpanes
