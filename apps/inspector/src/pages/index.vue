@@ -229,9 +229,9 @@ function formatBytes(bytes: number, decimals = 2) {
       <div v-auto-animate class="grid grid-cols-1 gap-2 2xl:grid-cols-3 sm:grid-cols-2" max-h="80dvh" overflow-y-auto>
         <div
           v-for="item in filteredItems" :key="item.id"
-          class="flex flex-col overflow-hidden border border-2 border-neutral-100 rounded-xl bg-neutral-200/50 shadow-sm transition-all duration-200 dark:border-neutral-800 hover:border-primary-300 dark:bg-neutral-900/50 hover:shadow-md dark:hover:border-primary-700"
+          class="flex flex-col overflow-hidden border border-2 border-neutral-100 rounded-xl bg-neutral-200/50 shadow-sm transition-all duration-200 dark:border-neutral-800 hover:border-primary-300 dark:bg-neutral-800/50 hover:shadow-md dark:hover:border-primary-700"
         >
-          <div class="flex-grow rounded-b-xl bg-neutral-900 bg-white p-3" @click="toggleItem(item.id)">
+          <div class="flex-grow rounded-b-xl bg-white p-3 dark:bg-neutral-900" @click="toggleItem(item.id)">
             <div class="relative cursor-pointer gap-3">
               <div class="min-w-0 flex flex-1 flex-col gap-2">
                 <!-- Line 1: Category Icon & Badge -->
