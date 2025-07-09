@@ -20,7 +20,7 @@
   <img src="./apps/inspector/public/favicon.svg">HuggingFace Inspector
 </h1>
 
-[[Try it](https://huggingface-inspector.netlify.app)]
+[[Try it](https://hf-inspector.moeru.ai/#/)]
 
 ## License
 
