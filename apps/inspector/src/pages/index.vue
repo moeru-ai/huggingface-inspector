@@ -320,7 +320,7 @@ function formatBytes(bytes: number, decimals = 2) {
 </script>
 
 <template>
-  <div class="h-full max-w-7xl w-full flex flex-col gap-6 p-4 lg:p-8 sm:p-6">
+  <div class="h-full max-w-full w-full flex flex-col gap-6 p-4 lg:p-8 sm:p-6">
     <!-- Initial State: Directory Selector -->
     <div v-if="cacheItems.length === 0 && !isLoading" class="h-full flex flex-1 flex-col items-center justify-center gap-4">
       <p class="mt-2 text-sm text-neutral-600 dark:text-neutral-400">
@@ -374,10 +374,10 @@ function formatBytes(bytes: number, decimals = 2) {
         </div>
       </div>
 
-      <div v-auto-animate class="grid grid-cols-1 gap-2 2xl:grid-cols-3 lg:grid-cols-2" max-h="80dvh" overflow-y-auto>
+      <div v-auto-animate class="grid grid-cols-1 gap-2 2xl:grid-cols-4 lg:grid-cols-2 xl:grid-cols-3" max-h="80dvh" overflow-y-auto>
         <div
           v-for="item in filteredItems" :key="item.id"
-          class="flex flex-col overflow-hidden border border-2 border-neutral-100 rounded-xl bg-neutral-200/50 shadow-sm transition-all duration-200 dark:border-neutral-800 hover:border-primary-300 dark:bg-neutral-800/50 hover:shadow-md dark:hover:border-primary-700"
+          class="h-fit flex flex-col overflow-hidden border border-2 border-neutral-100 rounded-xl bg-neutral-200/50 shadow-sm transition-all duration-200 dark:border-neutral-800 hover:border-primary-300 dark:bg-neutral-800/50 hover:shadow-md dark:hover:border-primary-700"
         >
           <div class="flex-grow rounded-b-xl bg-white p-3 dark:bg-neutral-900" @click="toggleItem(item.id)">
             <div class="relative cursor-pointer gap-3">
